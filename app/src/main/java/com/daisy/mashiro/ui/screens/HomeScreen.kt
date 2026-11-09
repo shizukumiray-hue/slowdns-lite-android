@@ -717,3 +717,18 @@ fun HomeScreen(
         }
     }
 }
+
+@Composable
+fun UsageItem(label: String, bytes: Long) {
+    Column(
+        modifier = Modifier.width(140.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Text(label, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(
+            text = TrafficStatsManager.formatBytes(bytes),
+            fontWeight = FontWeight.Bold,
+            fontSize = 14.sp
+        )
+    }
+}
