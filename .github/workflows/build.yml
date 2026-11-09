@@ -78,7 +78,7 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         if: env.KEYSTORE_BASE64 != ''
         run: |
-          echo "$KEYSTORE_BASE64" | base64 -d > app/release.keystore
+          python3 -c "import base64, os; open('app/release.keystore', 'wb').write(base64.b64decode(os.environ['KEYSTORE_BASE64'].strip()))"
 
       - name: Build Signed APKs (v7, v8, universal)
         env:
