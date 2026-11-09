@@ -1,0 +1,83 @@
+name: Build SlowDNS Lite APK (ARMv7 & ARMv8)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-go-core:
+    name: Build Go Core AAR (ARMv7 + ARMv8)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+          add-to-path: true
+
+      - name: Install GoMobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
+
+      - name: Compile Go Core to AAR
+        working-directory: core
+        run: |
+          go mod tidy
+          mkdir -p ../app/libs
+          # Target ARMv8 (arm64-v8a) & ARMv7 (armeabi-v7a)
+          gomobile bind -v -target=android/arm64,android/arm -androidapi 21 -o ../app/libs/TunnelCore.aar .
+
+      - name: Upload Core AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: TunnelCore-aar
+          path: app/libs/TunnelCore.aar
+
+  build-apk:
+    name: Build APK (v7, v8 & Universal)
+    needs: build-go-core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Download Core AAR
+        uses: actions/download-artifact@v4
+        with:
+          name: TunnelCore-aar
+          path: app/libs
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+
+      - name: Build Debug APKs (v7, v8, universal)
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: slowdns-lite-apks
+          path: app/build/outputs/apk/debug/*.apk
