@@ -10,10 +10,14 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.daisy.mashiro.MainActivity
+import com.daisy.mashiro.data.ConnectionState
 import com.daisy.mashiro.data.TrafficStatsManager
 import com.daisy.mashiro.logger.AppLogger
 import dev.epro.sock5tunnel.Socks5Tunnel
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 class TunnelVpnService : VpnService() {
 
@@ -28,6 +32,9 @@ class TunnelVpnService : VpnService() {
         const val ACTION_STOP = "com.daisy.mashiro.STOP"
         const val CHANNEL_ID = "SlowDnsTunnelChannel"
         const val NOTIFICATION_ID = 1001
+
+        private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
+        val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
         var isServiceRunning = false
             private set
@@ -104,6 +111,7 @@ class TunnelVpnService : VpnService() {
         val titleTarget = if (useSlowDns) domain else sshHost
         startForeground(NOTIFICATION_ID, buildNotification("Menghubungkan ke $titleTarget..."))
         isServiceRunning = true
+        _connectionState.value = ConnectionState.CONNECTING
 
         wakeLockManager.acquire(wakeLockEnabled)
         statsManager.resetSession()
@@ -123,6 +131,7 @@ class TunnelVpnService : VpnService() {
                 vpnInterface = builder.establish()
                 if (vpnInterface == null) {
                     AppLogger.log("[VPN] Error: Gagal menginisialisasi TUN interface")
+                    _connectionState.value = ConnectionState.DISCONNECTED
                     stopTunnel()
                     return@launch
                 }
@@ -144,18 +153,20 @@ class TunnelVpnService : VpnService() {
                     if (mode == "v2ray") {
                         AppLogger.log("[VPN] V2Ray Mode: RAW TCP Stream (No TLS)")
                     } else {
-                        AppLogger.log("[VPN] SSH Mode: RAW TCP Stream")
+                        AppLogger.log("[VPN] SSH Mode: RAW TCP Stream ke $sshHost:$sshPort")
                     }
                 } else {
                     AppLogger.log("[VPN] Target Direct: $sshHost:$sshPort | Enhanced: $sshEnhanced")
                 }
 
-                updateNotification("Aktif: $titleTarget ($mode)")
+                updateNotification("Terhubung: $titleTarget ($mode)")
+                _connectionState.value = ConnectionState.CONNECTED
 
                 // Ticker pembaca traffic byte per detik
                 startTrafficTicker()
             } catch (e: Exception) {
                 AppLogger.log("[VPN] Exception start: ${e.message}")
+                _connectionState.value = ConnectionState.DISCONNECTED
                 stopTunnel()
             }
         }
@@ -166,9 +177,13 @@ class TunnelVpnService : VpnService() {
         tickerJob = serviceScope.launch {
             while (isActive && isServiceRunning) {
                 delay(1000)
-                // ponytail: mock counter sebelum gomobile aar dibuild di github action
-                val currentTx = vpnInterface?.let { System.currentTimeMillis() % 1024 * 50 } ?: 0L
-                val currentRx = vpnInterface?.let { System.currentTimeMillis() % 2048 * 80 } ?: 0L
+                // Real traffic stats dari hev-socks5-tunnel C lwIP
+                val stats = if (currentEngine == "hev" && Socks5Tunnel.isAvailable()) {
+                    Socks5Tunnel.tProxyGetStats()
+                } else null
+
+                val currentTx = stats?.getOrNull(0) ?: 0L
+                val currentRx = stats?.getOrNull(1) ?: 0L
 
                 statsManager.onTrafficTick(currentTx, currentRx)
             }
@@ -177,6 +192,7 @@ class TunnelVpnService : VpnService() {
 
     private fun stopTunnel() {
         AppLogger.log("[VPN] Memutuskan koneksi...")
+        _connectionState.value = ConnectionState.STOPPING
         tickerJob?.cancel()
         wakeLockManager.release()
 
@@ -196,6 +212,7 @@ class TunnelVpnService : VpnService() {
         }
 
         isServiceRunning = false
+        _connectionState.value = ConnectionState.DISCONNECTED
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         AppLogger.log("[VPN] Terowongan terputus")

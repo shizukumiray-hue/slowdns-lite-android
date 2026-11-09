@@ -3,10 +3,13 @@ package core
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +30,16 @@ type SocketProtector interface {
 type LogListener interface {
 	OnLog(line string)
 }
+
+type StatusListener interface {
+	OnStateChange(state int, message string)
+}
+
+const (
+	StateDisconnected = 0
+	StateConnecting   = 1
+	StateConnected    = 2
+)
 
 type Config struct {
 	Mode         string // "ssh" atau "v2ray"
@@ -51,35 +64,30 @@ type Config struct {
 	V2RayUUID string
 }
 
-var bufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 2048)
-		return &b
-	},
-}
-
 var (
-	mu          sync.Mutex
-	running     atomic.Bool
-	cancelFn    context.CancelFunc
-	wg          sync.WaitGroup
-	tunFile     *os.File
-	rawUdpConn  net.PacketConn
-	smuxSession *smux.Session
+	mu            sync.Mutex
+	running       atomic.Bool
+	cancelFn      context.CancelFunc
+	wg            sync.WaitGroup
+	tunFile       *os.File
+	rawUdpConn    net.PacketConn
+	smuxSession   *smux.Session
+	socksListener net.Listener
+	sshClient     *ssh.Client
 
 	txBytes atomic.Int64
 	rxBytes atomic.Int64
 )
 
-func StartTunnel(tunFd int, cfg *Config, protector SocketProtector, log LogListener) error {
+func StartTunnel(tunFd int, cfg *Config, protector SocketProtector, log LogListener, status StatusListener) error {
 	mu.Lock()
 	defer mu.Unlock()
 
 	if running.Load() {
 		return errors.New("tunnel sudah aktif")
 	}
-	if cfg == nil || tunFd <= 0 {
-		return errors.New("parameter tidak valid")
+	if cfg == nil {
+		return errors.New("parameter konfigurasi kosong")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -89,48 +97,55 @@ func StartTunnel(tunFd int, cfg *Config, protector SocketProtector, log LogListe
 	txBytes.Store(0)
 	rxBytes.Store(0)
 
-	tunFile = os.NewFile(uintptr(tunFd), "/dev/tun")
+	if tunFd > 0 {
+		tunFile = os.NewFile(uintptr(tunFd), "/dev/tun")
+	}
+
+	updateState(status, StateConnecting, "Menghubungkan...")
 
 	if cfg.UseSlowDNS {
 		logMsg(log, fmt.Sprintf("[Core] Memulai SlowDNS: Mode %s over UDP 53", cfg.Mode))
-		return startSlowDnsTunnel(ctx, cfg, protector, log)
+		return startSlowDnsTunnel(ctx, cfg, protector, log, status)
 	}
 
 	logMsg(log, fmt.Sprintf("[Core] Direct Mode: %s", cfg.Mode))
-	return startDirectTunnel(ctx, cfg, protector, log)
+	return startDirectTunnel(ctx, cfg, protector, log, status)
 }
 
-func startSlowDnsTunnel(ctx context.Context, cfg *Config, protector SocketProtector, log LogListener) error {
-	// 1. Parse Domain NS
+func startSlowDnsTunnel(ctx context.Context, cfg *Config, protector SocketProtector, log LogListener, status StatusListener) error {
+	// 1. Validasi Domain & Public Key
 	parsedDomain, err := dns.ParseName(cfg.Domain)
 	if err != nil {
 		stopTunnelLocked()
+		updateState(status, StateDisconnected, "Domain tidak valid")
 		return fmt.Errorf("domain tidak valid: %w", err)
 	}
 
-	// 2. Decode Public Key Server (Curve25519)
 	pubkeyBytes, err := noise.DecodeKey(cfg.ServerPubKey)
 	if err != nil {
 		stopTunnelLocked()
+		updateState(status, StateDisconnected, "Public key server tidak valid")
 		return fmt.Errorf("public key server tidak valid: %w", err)
 	}
 
-	// 3. Resolve Alamat DNS Resolver
+	// 2. Resolve DNS Resolver
 	rAddr, err := net.ResolveUDPAddr("udp", cfg.Resolver)
 	if err != nil {
 		stopTunnelLocked()
+		updateState(status, StateDisconnected, "Resolver DNS gagal ditemukan")
 		return fmt.Errorf("resolve resolver dns gagal: %w", err)
 	}
 
-	// 4. Buka Socket UDP Fisik
+	// 3. Listen UDP Socket Fisik
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		stopTunnelLocked()
+		updateState(status, StateDisconnected, "Gagal membuat socket UDP")
 		return fmt.Errorf("listen udp gagal: %w", err)
 	}
 	rawUdpConn = conn
 
-	// 5. Bypass TUN Loop via Android SocketProtector
+	// 4. Socket Protector
 	rawConn, err := conn.SyscallConn()
 	if err == nil {
 		_ = rawConn.Control(func(fd uintptr) {
@@ -140,23 +155,22 @@ func startSlowDnsTunnel(ctx context.Context, cfg *Config, protector SocketProtec
 		})
 	}
 
-	// 6. Bungkus Socket dengan DNSPacketConn (Base32 QNAME + TXT/CNAME RDATA)
+	// 5. Wrap DNSPacketConn
 	pconn := dnstt.NewDNSPacketConn(conn, rAddr, parsedDomain)
 
-	// 7. Hitung MTU Berdasarkan Panjang Domain
 	mtu := (253 - len(cfg.Domain) - 2) * 5 / 8 - 8 - 1 - 3 - 1
 	if mtu < 80 {
 		mtu = 80
 	}
 
-	// 8. Inisialisasi KCP Reliable Transport di Atas DNS
+	// 6. Inisialisasi KCP
 	kcpConn, err := kcp.NewConn2(rAddr, nil, 0, 0, pconn)
 	if err != nil {
 		stopTunnelLocked()
+		updateState(status, StateDisconnected, "Gagal inisialisasi KCP")
 		return fmt.Errorf("koneksi kcp gagal: %w", err)
 	}
 	kcpConn.SetStreamMode(true)
-	// Dynamic KCP Clock: 50ms (battery saver) vs 20ms (performance)
 	kcpInterval := cfg.KcpInterval
 	if kcpInterval <= 0 {
 		kcpInterval = 50
@@ -165,16 +179,17 @@ func startSlowDnsTunnel(ctx context.Context, cfg *Config, protector SocketProtec
 	kcpConn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 	_ = kcpConn.SetMtu(mtu)
 
-	logMsg(log, fmt.Sprintf("[SlowDNS] Handshake Noise_NK ke %s...", cfg.Domain))
+	logMsg(log, fmt.Sprintf("[SlowDNS] Melakukan handshake Noise_NK ke %s...", cfg.Domain))
 
-	// 9. Enkripsi E2EE Noise Protocol (Curve25519 + ChaCha20-Poly1305)
+	// 7. Enkripsi E2EE Noise Protocol
 	noiseClient, err := noise.NewClient(kcpConn, pubkeyBytes)
 	if err != nil {
 		stopTunnelLocked()
+		updateState(status, StateDisconnected, "Handshake Noise gagal")
 		return fmt.Errorf("handshake noise gagal: %w", err)
 	}
 
-	// 10. Smux Multiplexer
+	// 8. Multiplexer Smux
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	smuxConfig.KeepAliveTimeout = 30 * time.Second
@@ -183,52 +198,177 @@ func startSlowDnsTunnel(ctx context.Context, cfg *Config, protector SocketProtec
 	sess, err := smux.Client(noiseClient, smuxConfig)
 	if err != nil {
 		stopTunnelLocked()
+		updateState(status, StateDisconnected, "Gagal membuat sesi smux")
 		return fmt.Errorf("inisialisasi smux gagal: %w", err)
 	}
 	smuxSession = sess
 
-	logMsg(log, "[SlowDNS] Terowongan Noise + KCP + smux berhasil terhubung!")
+	logMsg(log, "[SlowDNS] Terowongan Noise + KCP + smux terhubung")
 
-	// 11. Salurkan traffic TUN ke dalam stream SlowDNS
+	// 9. Jika mode SSH: Inisialisasi koneksi SSH di atas stream SlowDNS
+	if cfg.Mode == "ssh" {
+		logMsg(log, "[SSH] Memulai autentikasi Dropbear SSH...")
+		stream, err := sess.OpenStream()
+		if err != nil {
+			stopTunnelLocked()
+			updateState(status, StateDisconnected, "Gagal membuka stream SSH")
+			return fmt.Errorf("open stream ssh gagal: %w", err)
+		}
+
+		client, err := DialSshRawTcp(stream, cfg.SSHHost, cfg.SSHPort, cfg.SSHUser, cfg.SSHPassword)
+		if err != nil {
+			stopTunnelLocked()
+			updateState(status, StateDisconnected, fmt.Sprintf("Autentikasi SSH gagal: %v", err))
+			return fmt.Errorf("autentikasi ssh gagal: %w", err)
+		}
+		sshClient = client
+		logMsg(log, fmt.Sprintf("[SSH] Berhasil login sebagai user: %s", cfg.SSHUser))
+	}
+
+	// 10. Start Local SOCKS5 Server di 127.0.0.1:1080 untuk HEV Tunnel
+	ln, err := net.Listen("tcp", "127.0.0.1:1080")
+	if err != nil {
+		stopTunnelLocked()
+		updateState(status, StateDisconnected, "Gagal membuka port SOCKS lokal 1080")
+		return fmt.Errorf("listen socks5 gagal: %w", err)
+	}
+	socksListener = ln
+
+	logMsg(log, "[SOCKS5] Server lokal aktif di 127.0.0.1:1080")
+	updateState(status, StateConnected, "Terhubung")
+
 	wg.Add(1)
-	go pumpTunTraffic(ctx, tunFile, sess, cfg, log)
+	go acceptSocksClients(ctx, ln, sess, cfg, log)
 
 	return nil
 }
 
-func pumpTunTraffic(ctx context.Context, tun *os.File, sess *smux.Session, cfg *Config, log LogListener) {
+func startDirectTunnel(ctx context.Context, cfg *Config, protector SocketProtector, log LogListener, status StatusListener) error {
+	ln, err := net.Listen("tcp", "127.0.0.1:1080")
+	if err != nil {
+		stopTunnelLocked()
+		updateState(status, StateDisconnected, "Gagal membuka port SOCKS lokal 1080")
+		return fmt.Errorf("listen socks5 direct gagal: %w", err)
+	}
+	socksListener = ln
+
+	logMsg(log, "[Direct] Server lokal aktif di 127.0.0.1:1080")
+	updateState(status, StateConnected, "Terhubung (Direct)")
+
+	wg.Add(1)
+	go acceptSocksClients(ctx, ln, nil, cfg, log)
+
+	return nil
+}
+
+func acceptSocksClients(ctx context.Context, ln net.Listener, sess *smux.Session, cfg *Config, log LogListener) {
 	defer wg.Done()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			bufPtr := bufPool.Get().(*[]byte)
-			buf := *bufPtr
-
-			_ = tun.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			n, err := tun.Read(buf)
-			if err != nil {
-				bufPool.Put(bufPtr)
-				if errors.Is(err, os.ErrDeadlineExceeded) {
-					continue
-				}
+		clientConn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
 				return
+			default:
+				continue
 			}
-
-			txBytes.Add(int64(n))
-
-			// ponytail: forward paket TUN ke virtual stream smux
-			// upgrade: tambahkan full userspace netstack listener saat multi-client routing aktif
-			bufPool.Put(bufPtr)
 		}
+
+		go handleClient(ctx, clientConn, sess, cfg, log)
 	}
 }
 
-func startDirectTunnel(ctx context.Context, cfg *Config, protector SocketProtector, log LogListener) error {
-	logMsg(log, "[Direct] Menghubungkan langsung ke target upstream...")
-	return nil
+func handleClient(ctx context.Context, local net.Conn, sess *smux.Session, cfg *Config, log LogListener) {
+	defer local.Close()
+
+	destHost, destPort, err := HandleSocks5Conn(local)
+	if err != nil {
+		return
+	}
+
+	var remote io.ReadWriteCloser
+
+	if cfg.UseSlowDNS {
+		if cfg.Mode == "ssh" && sshClient != nil {
+			// Forward melalui channel direct-tcpip SSH
+			targetAddr := fmt.Sprintf("%s:%d", destHost, destPort)
+			ch, err := sshClient.Dial("tcp", targetAddr)
+			if err != nil {
+				return
+			}
+			remote = ch
+		} else {
+			// Forward melalui stream VLESS RAW TCP
+			stream, err := sess.OpenStream()
+			if err != nil {
+				return
+			}
+
+			uuidClean := strings.ReplaceAll(cfg.V2RayUUID, "-", "")
+			uuidBytes, _ := hex.DecodeString(uuidClean)
+			if len(uuidBytes) != 16 {
+				uuidBytes = make([]byte, 16)
+			}
+
+			vlessHeader := BuildVlessRawTcpHeader(uuidBytes, destHost, destPort)
+			if _, err := stream.Write(vlessHeader); err != nil {
+				stream.Close()
+				return
+			}
+			remote = stream
+		}
+	} else {
+		// Direct dial ke target
+		targetAddr := fmt.Sprintf("%s:%d", destHost, destPort)
+		ch, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+		if err != nil {
+			return
+		}
+		remote = ch
+	}
+	defer remote.Close()
+
+	pipeTraffic(local, remote)
+}
+
+func pipeTraffic(a io.ReadWriter, b io.ReadWriter) {
+	var pipeWg sync.WaitGroup
+	pipeWg.Add(2)
+
+	// a -> b (Upload / Tx)
+	go func() {
+		defer pipeWg.Done()
+		buf := make([]byte, 2048)
+		for {
+			n, err := a.Read(buf)
+			if n > 0 {
+				nw, _ := b.Write(buf[:n])
+				txBytes.Add(int64(nw))
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// b -> a (Download / Rx)
+	go func() {
+		defer pipeWg.Done()
+		buf := make([]byte, 2048)
+		for {
+			n, err := b.Read(buf)
+			if n > 0 {
+				nw, _ := a.Write(buf[:n])
+				rxBytes.Add(int64(nw))
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	pipeWg.Wait()
 }
 
 func BuildVlessRawTcpHeader(uuidBytes []byte, targetHost string, targetPort uint16) []byte {
@@ -248,17 +388,25 @@ func BuildVlessRawTcpHeader(uuidBytes []byte, targetHost string, targetPort uint
 	return buf
 }
 
-func DialSshRawTcp(conn net.Conn, user, pass string) (*ssh.Client, error) {
+func DialSshRawTcp(conn net.Conn, host string, port int, user, pass string) (*ssh.Client, error) {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if port <= 0 {
+		port = 22
+	}
+	targetAddr := fmt.Sprintf("%s:%d", host, port)
+
 	sshConfig := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
 			ssh.Password(pass),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
+		Timeout:         15 * time.Second,
 	}
 
-	c, chans, reqs, err := ssh.NewClientConn(conn, "127.0.0.1:22", sshConfig)
+	c, chans, reqs, err := ssh.NewClientConn(conn, targetAddr, sshConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -280,6 +428,14 @@ func stopTunnelLocked() {
 		cancelFn()
 	}
 
+	if socksListener != nil {
+		_ = socksListener.Close()
+		socksListener = nil
+	}
+	if sshClient != nil {
+		_ = sshClient.Close()
+		sshClient = nil
+	}
 	if smuxSession != nil {
 		_ = smuxSession.Close()
 		smuxSession = nil
@@ -312,5 +468,11 @@ func GetRxBytes() int64 {
 func logMsg(l LogListener, msg string) {
 	if l != nil {
 		l.OnLog(msg)
+	}
+}
+
+func updateState(s StatusListener, state int, msg string) {
+	if s != nil {
+		s.OnStateChange(state, msg)
 	}
 }

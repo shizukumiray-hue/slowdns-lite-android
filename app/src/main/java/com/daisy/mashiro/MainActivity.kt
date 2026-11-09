@@ -12,6 +12,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
+import com.daisy.mashiro.data.ConnectionState
 import com.daisy.mashiro.data.TrafficStatsManager
 import com.daisy.mashiro.data.TrafficSummary
 import com.daisy.mashiro.logger.AppLogger
@@ -22,7 +23,6 @@ import com.daisy.mashiro.ui.theme.SlowDnsTheme
 class MainActivity : ComponentActivity() {
 
     private var pendingIntent: Intent? = null
-    private var isConnectedState by mutableStateOf(false)
     private lateinit var statsManager: TrafficStatsManager
 
     private val vpnPermissionLauncher = registerForActivityResult(
@@ -31,7 +31,6 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == Activity.RESULT_OK) {
             pendingIntent?.let {
                 startForegroundService(it)
-                isConnectedState = true
                 AppLogger.log("[App] Izin VPN disetujui, memulai koneksi")
             }
         } else {
@@ -50,11 +49,12 @@ class MainActivity : ComponentActivity() {
 
             val liveStatsManager = TunnelVpnService.activeStatsManager ?: statsManager
             val trafficSummary by liveStatsManager.summaryFlow.collectAsState(initial = TrafficSummary())
+            val connectionState by TunnelVpnService.connectionState.collectAsState()
 
             SlowDnsTheme(darkTheme = isDarkMode) {
                 Surface {
                     HomeScreen(
-                        isConnected = isConnectedState,
+                        connectionState = connectionState,
                         isDarkMode = isDarkMode,
                         onToggleDarkMode = { isDarkMode = !isDarkMode },
                         trafficSummary = trafficSummary,
@@ -62,6 +62,7 @@ class MainActivity : ComponentActivity() {
                                             sshHost, sshPort, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
                                             v2rayRawLink, v2rayUuid, wakeLock, kcpInterval, customDns, engine ->
                             handleConnectToggle(
+                                connectionState,
                                 mode, useSlowDns, domain, pubkey, resolver, recordType,
                                 sshHost, sshPort, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
                                 v2rayRawLink, v2rayUuid, wakeLock, kcpInterval, customDns, engine
@@ -75,6 +76,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleConnectToggle(
+        connectionState: ConnectionState,
         mode: String,
         useSlowDns: Boolean,
         domain: String,
@@ -95,13 +97,12 @@ class MainActivity : ComponentActivity() {
         customDns: String,
         engine: String
     ) {
-        if (isConnectedState) {
+        if (connectionState == ConnectionState.CONNECTED || connectionState == ConnectionState.CONNECTING) {
             val stopIntent = Intent(this, TunnelVpnService::class.java).apply {
                 action = TunnelVpnService.ACTION_STOP
             }
             startService(stopIntent)
-            isConnectedState = false
-            AppLogger.log("[App] Koneksi dihentikan oleh pengguna")
+            AppLogger.log("[App] Menghentikan koneksi...")
             return
         }
 
@@ -111,11 +112,11 @@ class MainActivity : ComponentActivity() {
                 Toast.makeText(this, "Domain NS dan Server Public Key wajib diisi!", Toast.LENGTH_SHORT).show()
                 return
             }
-        } else {
-            if (mode == "ssh" && sshHost.isBlank()) {
-                Toast.makeText(this, "SSH Host/IP wajib diisi!", Toast.LENGTH_SHORT).show()
-                return
-            }
+        }
+
+        if (mode == "ssh" && sshUser.isBlank()) {
+            Toast.makeText(this, "SSH Username wajib diisi!", Toast.LENGTH_SHORT).show()
+            return
         }
 
         val startIntent = Intent(this, TunnelVpnService::class.java).apply {
@@ -147,13 +148,11 @@ class MainActivity : ComponentActivity() {
             vpnPermissionLauncher.launch(vpnPrepareIntent)
         } else {
             startForegroundService(startIntent)
-            isConnectedState = true
             AppLogger.log("[App] Memulai service VPN...")
         }
     }
 
     override fun onResume() {
         super.onResume()
-        isConnectedState = TunnelVpnService.isServiceRunning
     }
 }
