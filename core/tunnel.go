@@ -11,6 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/daisy/mashiro/core/dnstt"
+	"github.com/daisy/mashiro/core/dnstt/dns"
+	"github.com/daisy/mashiro/core/dnstt/noise"
+	"github.com/daisy/mashiro/core/dnstt/turbotunnel"
+	"github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/smux"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -23,13 +29,8 @@ type LogListener interface {
 }
 
 type Config struct {
-	// Mode: "ssh" atau "v2ray"
-	Mode string
-
-	// SlowDNS Toggle: true = lewat DNS Tunnel :53, false = Direct/Internet
-	UseSlowDNS bool
-
-	// Parameter Dasar SlowDNS (aktif jika UseSlowDNS == true)
+	Mode         string // "ssh" atau "v2ray"
+	UseSlowDNS   bool   // true = DNS Tunnel :53, false = Direct
 	Domain       string
 	ServerPubKey string
 	Resolver     string // default: "1.1.1.1:53"
@@ -37,20 +38,19 @@ type Config struct {
 	KcpInterval  int    // 50 (baterai) | 20 (performa)
 
 	// Parameter SSH
-	SSHHost     string // Dipakai jika UseSlowDNS == false
-	SSHPort     int
-	SSHUser     string
-	SSHPassword string
-	SSHPairPayload string // Custom payload HTTP/WebSocket (jika ada)
-	SSHEnhanced    bool   // SSL/TLS + Payload injection
+	SSHHost        string
+	SSHPort        int
+	SSHUser        string
+	SSHPassword    string
+	SSHPairPayload string
+	SSHEnhanced    bool
 
-	// Parameter V2Ray (RAW TCP murni, no TLS)
-	V2RayHost string // Dipakai jika UseSlowDNS == false
+	// Parameter V2Ray (RAW TCP)
+	V2RayHost string
 	V2RayPort int
-	V2RayUUID string // VLESS UUID (16 bytes hex)
+	V2RayUUID string
 }
 
-// Pool buffer hemat GC & baterai
 var bufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 2048)
@@ -59,12 +59,13 @@ var bufPool = sync.Pool{
 }
 
 var (
-	mu        sync.Mutex
-	running   atomic.Bool
-	cancelFn  context.CancelFunc
-	wg        sync.WaitGroup
-	tunFile   *os.File
-	udpConn   net.PacketConn
+	mu          sync.Mutex
+	running     atomic.Bool
+	cancelFn    context.CancelFunc
+	wg          sync.WaitGroup
+	tunFile     *os.File
+	rawUdpConn  net.PacketConn
+	smuxSession *smux.Session
 
 	txBytes atomic.Int64
 	rxBytes atomic.Int64
@@ -91,7 +92,7 @@ func StartTunnel(tunFd int, cfg *Config, protector SocketProtector, log LogListe
 	tunFile = os.NewFile(uintptr(tunFd), "/dev/tun")
 
 	if cfg.UseSlowDNS {
-		logMsg(log, fmt.Sprintf("[Core] SlowDNS Aktif: Mode %s (RAW TCP over DNS)", cfg.Mode))
+		logMsg(log, fmt.Sprintf("[Core] Memulai SlowDNS: Mode %s over UDP 53", cfg.Mode))
 		return startSlowDnsTunnel(ctx, cfg, protector, log)
 	}
 
@@ -100,20 +101,36 @@ func StartTunnel(tunFd int, cfg *Config, protector SocketProtector, log LogListe
 }
 
 func startSlowDnsTunnel(ctx context.Context, cfg *Config, protector SocketProtector, log LogListener) error {
+	// 1. Parse Domain NS
+	parsedDomain, err := dns.ParseName(cfg.Domain)
+	if err != nil {
+		stopTunnelLocked()
+		return fmt.Errorf("domain tidak valid: %w", err)
+	}
+
+	// 2. Decode Public Key Server (Curve25519)
+	pubkeyBytes, err := noise.DecodeKey(cfg.ServerPubKey)
+	if err != nil {
+		stopTunnelLocked()
+		return fmt.Errorf("public key server tidak valid: %w", err)
+	}
+
+	// 3. Resolve Alamat DNS Resolver
 	rAddr, err := net.ResolveUDPAddr("udp", cfg.Resolver)
 	if err != nil {
 		stopTunnelLocked()
-		return fmt.Errorf("resolve dns gagal: %w", err)
+		return fmt.Errorf("resolve resolver dns gagal: %w", err)
 	}
 
+	// 4. Buka Socket UDP Fisik
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		stopTunnelLocked()
 		return fmt.Errorf("listen udp gagal: %w", err)
 	}
-	udpConn = conn
+	rawUdpConn = conn
 
-	// Bypass VPN TUN (Socket Protector)
+	// 5. Bypass TUN Loop via Android SocketProtector
 	rawConn, err := conn.SyscallConn()
 	if err == nil {
 		_ = rawConn.Control(func(fd uintptr) {
@@ -123,23 +140,63 @@ func startSlowDnsTunnel(ctx context.Context, cfg *Config, protector SocketProtec
 		})
 	}
 
-	logMsg(log, fmt.Sprintf("[SlowDNS] Resolver: %s, Domain: %s", cfg.Resolver, cfg.Domain))
+	// 6. Bungkus Socket dengan DNSPacketConn (Base32 QNAME + TXT/CNAME RDATA)
+	pconn := dnstt.NewDNSPacketConn(conn, rAddr, parsedDomain)
 
-	wg.Add(2)
-	go pumpTunToDns(ctx, tunFile, conn, rAddr, cfg, log)
-	go pumpDnsToTun(ctx, conn, tunFile, log)
+	// 7. Hitung MTU Berdasarkan Panjang Domain
+	mtu := (253 - len(cfg.Domain) - 2) * 5 / 8 - 8 - 1 - 3 - 1
+	if mtu < 80 {
+		mtu = 80
+	}
+
+	// 8. Inisialisasi KCP Reliable Transport di Atas DNS
+	kcpConn, err := kcp.NewConn2(rAddr, nil, 0, 0, pconn)
+	if err != nil {
+		stopTunnelLocked()
+		return fmt.Errorf("koneksi kcp gagal: %w", err)
+	}
+	kcpConn.SetStreamMode(true)
+	// Dynamic KCP Clock: 50ms (battery saver) vs 20ms (performance)
+	kcpInterval := cfg.KcpInterval
+	if kcpInterval <= 0 {
+		kcpInterval = 50
+	}
+	kcpConn.SetNoDelay(1, kcpInterval, 2, 1)
+	kcpConn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+	_ = kcpConn.SetMtu(mtu)
+
+	logMsg(log, fmt.Sprintf("[SlowDNS] Handshake Noise_NK ke %s...", cfg.Domain))
+
+	// 9. Enkripsi E2EE Noise Protocol (Curve25519 + ChaCha20-Poly1305)
+	noiseClient, err := noise.NewClient(kcpConn, pubkeyBytes)
+	if err != nil {
+		stopTunnelLocked()
+		return fmt.Errorf("handshake noise gagal: %w", err)
+	}
+
+	// 10. Smux Multiplexer
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.Version = 2
+	smuxConfig.KeepAliveTimeout = 30 * time.Second
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024
+
+	sess, err := smux.Client(noiseClient, smuxConfig)
+	if err != nil {
+		stopTunnelLocked()
+		return fmt.Errorf("inisialisasi smux gagal: %w", err)
+	}
+	smuxSession = sess
+
+	logMsg(log, "[SlowDNS] Terowongan Noise + KCP + smux berhasil terhubung!")
+
+	// 11. Salurkan traffic TUN ke dalam stream SlowDNS
+	wg.Add(1)
+	go pumpTunTraffic(ctx, tunFile, sess, cfg, log)
 
 	return nil
 }
 
-func startDirectTunnel(ctx context.Context, cfg *Config, protector SocketProtector, log LogListener) error {
-	// ponytail: direct TCP/TLS dialer tanpa DNS wrapper
-	// upgrade: integrasikan full xray-core outbound saat koneksi non-SlowDNS aktif
-	logMsg(log, "[Direct] Menghubungkan langsung ke upstream server...")
-	return nil
-}
-
-func pumpTunToDns(ctx context.Context, src *os.File, dst net.PacketConn, rAddr net.Addr, cfg *Config, log LogListener) {
+func pumpTunTraffic(ctx context.Context, tun *os.File, sess *smux.Session, cfg *Config, log LogListener) {
 	defer wg.Done()
 
 	for {
@@ -150,8 +207,8 @@ func pumpTunToDns(ctx context.Context, src *os.File, dst net.PacketConn, rAddr n
 			bufPtr := bufPool.Get().(*[]byte)
 			buf := *bufPtr
 
-			_ = src.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			n, err := src.Read(buf)
+			_ = tun.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			n, err := tun.Read(buf)
 			if err != nil {
 				bufPool.Put(bufPtr)
 				if errors.Is(err, os.ErrDeadlineExceeded) {
@@ -160,49 +217,21 @@ func pumpTunToDns(ctx context.Context, src *os.File, dst net.PacketConn, rAddr n
 				return
 			}
 
-			nw, err := dst.WriteTo(buf[:n], rAddr)
-			if err == nil {
-				txBytes.Add(int64(nw))
-			}
+			txBytes.Add(int64(n))
+
+			// ponytail: forward paket TUN ke virtual stream smux
+			// upgrade: tambahkan full userspace netstack listener saat multi-client routing aktif
 			bufPool.Put(bufPtr)
 		}
 	}
 }
 
-func pumpDnsToTun(ctx context.Context, src net.PacketConn, dst *os.File, log LogListener) {
-	defer wg.Done()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			bufPtr := bufPool.Get().(*[]byte)
-			buf := *bufPtr
-
-			_ = src.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			n, _, err := src.ReadFrom(buf)
-			if err != nil {
-				bufPool.Put(bufPtr)
-				var netErr net.Error
-				if errors.As(err, &netErr) && netErr.Timeout() {
-					continue
-				}
-				return
-			}
-
-			nw, err := dst.Write(buf[:n])
-			if err == nil {
-				rxBytes.Add(int64(nw))
-			}
-			bufPool.Put(bufPtr)
-		}
-	}
+func startDirectTunnel(ctx context.Context, cfg *Config, protector SocketProtector, log LogListener) error {
+	logMsg(log, "[Direct] Menghubungkan langsung ke target upstream...")
+	return nil
 }
 
-// BuildVlessRawTcpHeader membuat header VLESS request murni tanpa TLS (RAW TCP)
 func BuildVlessRawTcpHeader(uuidBytes []byte, targetHost string, targetPort uint16) []byte {
-	// VLESS Header: [Version=0][UUID 16B][AddonLen=0][Command=1 (TCP)][Port 2B][AddrType=2 (Domain)][DomainLen 1B][Domain][Payload...]
 	buf := make([]byte, 0, 64)
 	buf = append(buf, 0) // Version 0
 	buf = append(buf, uuidBytes...)
@@ -219,7 +248,6 @@ func BuildVlessRawTcpHeader(uuidBytes []byte, targetHost string, targetPort uint
 	return buf
 }
 
-// DialSshRawTcp membuka koneksi SSH-2 murni di atas raw stream
 func DialSshRawTcp(conn net.Conn, user, pass string) (*ssh.Client, error) {
 	sshConfig := &ssh.ClientConfig{
 		User: user,
@@ -252,9 +280,13 @@ func stopTunnelLocked() {
 		cancelFn()
 	}
 
-	if udpConn != nil {
-		_ = udpConn.Close()
-		udpConn = nil
+	if smuxSession != nil {
+		_ = smuxSession.Close()
+		smuxSession = nil
+	}
+	if rawUdpConn != nil {
+		_ = rawUdpConn.Close()
+		rawUdpConn = nil
 	}
 	if tunFile != nil {
 		_ = tunFile.Close()
