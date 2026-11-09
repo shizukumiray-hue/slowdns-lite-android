@@ -177,4 +177,7 @@ Alur 2-Job di `.github/workflows/build.yml`:
 - [x] Dukungan Format: V2Ray SlowDNS RAW TCP (`type=tcp&security=none`) + SSH SlowDNS RAW TCP (Nol Host).
 - [x] Mode Normal: SSH Direct / Enhanced (SSL + Payload) & V2Ray Full Core (WS/gRPC/TCP/xhttp/Mux).
 - [x] Pengaturan DNS: Pilihan Local DNS (bawaan ISP) atau Custom DNS manual + 9 Tipe Record DNS (TXT, AUTO, CNAME, dll).
+- [x] Pilihan Engine IP: HEV Socks5 Tunnel (C + lwIP, < 5MB RAM) vs gVisor Netstack (Pure Go) toggleable di Pengaturan.
+- [x] Native Libraries: `libhev-socks5-tunnel.so` untuk ARMv7 & ARMv8.
 - [x] ABI Output: armeabi-v7a (v7 / 32-bit), arm64-v8a (v8 / 64-bit), dan Universal APK.
+- [x] Distribusi Rilis: Otomatis upload terpisah per-file di GitHub Releases.

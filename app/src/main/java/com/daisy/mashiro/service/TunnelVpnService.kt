@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import com.daisy.mashiro.MainActivity
 import com.daisy.mashiro.data.TrafficStatsManager
 import com.daisy.mashiro.logger.AppLogger
+import dev.epro.sock5tunnel.Socks5Tunnel
 import kotlinx.coroutines.*
 
 class TunnelVpnService : VpnService() {
@@ -63,17 +64,20 @@ class TunnelVpnService : VpnService() {
                 val wakeLockEnabled = intent.getBooleanExtra("EXTRA_WAKELOCK", false)
                 val kcpInterval = intent.getIntExtra("EXTRA_KCP_INTERVAL", 50)
                 val customDns = intent.getStringExtra("EXTRA_CUSTOM_DNS") ?: ""
+                val engine = intent.getStringExtra("EXTRA_ENGINE") ?: "hev"
 
                 startTunnel(
                     mode, useSlowDns, domain, pubkey, resolver, recordType,
                     sshHost, sshPort, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
-                    v2rayLink, v2rayUuid, wakeLockEnabled, kcpInterval, customDns
+                    v2rayLink, v2rayUuid, wakeLockEnabled, kcpInterval, customDns, engine
                 )
             }
             ACTION_STOP -> stopTunnel()
         }
         return START_NOT_STICKY
     }
+
+    private var currentEngine: String = "hev"
 
     private fun startTunnel(
         mode: String,
@@ -93,8 +97,10 @@ class TunnelVpnService : VpnService() {
         v2rayUuid: String,
         wakeLockEnabled: Boolean,
         kcpInterval: Int,
-        customDns: String
+        customDns: String,
+        engine: String
     ) {
+        currentEngine = engine
         val titleTarget = if (useSlowDns) domain else sshHost
         startForeground(NOTIFICATION_ID, buildNotification("Menghubungkan ke $titleTarget..."))
         isServiceRunning = true
@@ -123,6 +129,15 @@ class TunnelVpnService : VpnService() {
 
                 val fd = vpnInterface!!.fd
                 AppLogger.log("[VPN] TUN siap (fd: $fd)")
+
+                // Inisialisasi engine paket IP (HEV Socks5 C lwIP atau gVisor Go)
+                if (currentEngine == "hev" && Socks5Tunnel.isAvailable()) {
+                    AppLogger.log("[Engine] Memulai HEV Socks5 Tunnel (C + lwIP, Ultra-hemat RAM)")
+                    val configYaml = Socks5Tunnel.generateConfig("127.0.0.1", 1080)
+                    Socks5Tunnel.tProxyStartService(configYaml, fd)
+                } else {
+                    AppLogger.log("[Engine] Memulai gVisor Netstack (Pure Go Userspace Stack)")
+                }
 
                 if (useSlowDns) {
                     AppLogger.log("[VPN] Target: SlowDNS :53 | Domain: $domain | Record: $recordType | Resolver: $resolver")
@@ -164,6 +179,14 @@ class TunnelVpnService : VpnService() {
         AppLogger.log("[VPN] Memutuskan koneksi...")
         tickerJob?.cancel()
         wakeLockManager.release()
+
+        if (currentEngine == "hev" && Socks5Tunnel.isAvailable()) {
+            try {
+                Socks5Tunnel.tProxyStopService()
+            } catch (e: Exception) {
+                AppLogger.log("[Engine] Error stop HEV Tunnel: ${e.message}")
+            }
+        }
 
         try {
             vpnInterface?.close()

@@ -53,7 +53,8 @@ fun HomeScreen(
         v2rayUuid: String,
         wakeLock: Boolean,
         kcpInterval: Int,
-        customDns: String
+        customDns: String,
+        engine: String
     ) -> Unit,
     context: Context
 ) {
@@ -86,6 +87,7 @@ fun HomeScreen(
     var batterySaverKcp by remember { mutableStateOf(true) }
     var isCustomDns by remember { mutableStateOf(false) }
     var customDnsServer by remember { mutableStateOf("1.1.1.1") }
+    var selectedEngine by remember { mutableStateOf("hev") } // "hev" atau "gvisor"
 
     val logs by AppLogger.logsFlow.collectAsState()
     val scrollState = rememberScrollState()
@@ -608,6 +610,26 @@ fun HomeScreen(
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text("Pengaturan Jaringan & Baterai", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
 
+                    // Pilihan IP Packet Engine (HEV vs gVisor)
+                    Text("IP Packet Engine:", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = selectedEngine == "hev",
+                            onClick = { if (!isConnected) selectedEngine = "hev" },
+                            label = { Text("HEV Tunnel (C lwIP)") },
+                            enabled = !isConnected
+                        )
+                        FilterChip(
+                            selected = selectedEngine == "gvisor",
+                            onClick = { if (!isConnected) selectedEngine = "gvisor" },
+                            label = { Text("gVisor (Pure Go)") },
+                            enabled = !isConnected
+                        )
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -673,7 +695,7 @@ fun HomeScreen(
                     onConnectToggle(
                         selectedProtocol, useSlowDns, domain, pubKey, resolver, selectedRecordType,
                         sshHost, port, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
-                        v2rayRawLink, v2rayUuid, wakeLockEnabled, kcpInt, dns
+                        v2rayRawLink, v2rayUuid, wakeLockEnabled, kcpInt, dns, selectedEngine
                     )
                 },
                 modifier = Modifier

@@ -60,11 +60,11 @@ class MainActivity : ComponentActivity() {
                         trafficSummary = trafficSummary,
                         onConnectToggle = { mode, useSlowDns, domain, pubkey, resolver, recordType,
                                             sshHost, sshPort, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
-                                            v2rayRawLink, v2rayUuid, wakeLock, kcpInterval, customDns ->
+                                            v2rayRawLink, v2rayUuid, wakeLock, kcpInterval, customDns, engine ->
                             handleConnectToggle(
                                 mode, useSlowDns, domain, pubkey, resolver, recordType,
                                 sshHost, sshPort, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
-                                v2rayRawLink, v2rayUuid, wakeLock, kcpInterval, customDns
+                                v2rayRawLink, v2rayUuid, wakeLock, kcpInterval, customDns, engine
                             )
                         },
                         context = this
@@ -92,7 +92,8 @@ class MainActivity : ComponentActivity() {
         v2rayUuid: String,
         wakeLock: Boolean,
         kcpInterval: Int,
-        customDns: String
+        customDns: String,
+        engine: String
     ) {
         if (isConnectedState) {
             val stopIntent = Intent(this, TunnelVpnService::class.java).apply {
@@ -137,6 +138,7 @@ class MainActivity : ComponentActivity() {
             putExtra("EXTRA_WAKELOCK", wakeLock)
             putExtra("EXTRA_KCP_INTERVAL", kcpInterval)
             putExtra("EXTRA_CUSTOM_DNS", customDns.trim())
+            putExtra("EXTRA_ENGINE", engine.trim())
         }
 
         val vpnPrepareIntent = VpnService.prepare(this)
