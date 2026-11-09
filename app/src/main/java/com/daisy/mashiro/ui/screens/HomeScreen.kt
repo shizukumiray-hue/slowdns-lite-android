@@ -60,6 +60,8 @@ fun HomeScreen(
         sshSni: String,
         v2rayRawLink: String,
         v2rayUuid: String,
+        v2rayHost: String,
+        v2rayPort: Int,
         wakeLock: Boolean,
         kcpInterval: Int,
         customDns: String,
@@ -90,8 +92,10 @@ fun HomeScreen(
     var sshPayload by remember { mutableStateOf("") }
     var sshSni by remember { mutableStateOf("") }
 
-    // V2Ray
+    // V2Ray (Host & Port 80 SELALU ADA di HC)
     var v2rayRawLink by remember { mutableStateOf("") }
+    var v2rayHost by remember { mutableStateOf("127.0.0.1") }
+    var v2rayPort by remember { mutableStateOf("80") }
     var v2rayUuid by remember { mutableStateOf("") }
 
     // Settings
@@ -135,6 +139,9 @@ fun HomeScreen(
                     v2rayRawLink = trimmed
                     val uri = URI(trimmed.replace("vless://", "http://"))
                     v2rayUuid = uri.userInfo ?: ""
+                    v2rayHost = uri.host ?: "127.0.0.1"
+                    val p = uri.port
+                    v2rayPort = if (p > 0) p.toString() else "80"
                     Toast.makeText(context, "Link VLESS berhasil diimpor!", Toast.LENGTH_SHORT).show()
                 }
                 trimmed.startsWith("vmess://") -> {
@@ -598,27 +605,52 @@ fun HomeScreen(
                                 }
                             }
 
-                            // 6. Parameter V2Ray
+                            // 6. Parameter V2Ray (HOST & PORT 80 SELALU ADA)
                             AnimatedVisibility(visible = selectedProtocol == "v2ray") {
                                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                    if (useSlowDns) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
                                         OutlinedTextField(
-                                            value = v2rayUuid,
-                                            onValueChange = { v2rayUuid = it },
-                                            label = { Text("VLESS / VMess UUID") },
-                                            placeholder = { Text("d3b07384-d113-4f9e-...") },
-                                            modifier = Modifier.fillMaxWidth(),
+                                            value = v2rayHost,
+                                            onValueChange = { v2rayHost = it },
+                                            label = { Text("V2Ray Host / Server IP") },
+                                            placeholder = { Text("127.0.0.1") },
+                                            modifier = Modifier.weight(1f),
                                             singleLine = true,
                                             enabled = !isConnected && !isConnecting
                                         )
-                                    } else {
+                                        OutlinedTextField(
+                                            value = v2rayPort,
+                                            onValueChange = { v2rayPort = it },
+                                            label = { Text("Port") },
+                                            placeholder = { Text("80") },
+                                            modifier = Modifier.width(95.dp),
+                                            singleLine = true,
+                                            enabled = !isConnected && !isConnecting
+                                        )
+                                    }
+
+                                    OutlinedTextField(
+                                        value = v2rayUuid,
+                                        onValueChange = { v2rayUuid = it },
+                                        label = { Text("VLESS / VMess UUID") },
+                                        placeholder = { Text("d3b07384-d113-4f9e-...") },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        singleLine = true,
+                                        enabled = !isConnected && !isConnecting
+                                    )
+
+                                    AnimatedVisibility(visible = !useSlowDns) {
                                         OutlinedTextField(
                                             value = v2rayRawLink,
                                             onValueChange = {
                                                 v2rayRawLink = it
                                                 parseClipboard(it)
                                             },
-                                            label = { Text("Tempel Link V2Ray (vless://, vmess://)") },
+                                            label = { Text("Tempel Link Lengkap (WS/gRPC/TLS)") },
+                                            placeholder = { Text("vless://...@...:443?type=ws...") },
                                             modifier = Modifier.fillMaxWidth(),
                                             maxLines = 3,
                                             enabled = !isConnected && !isConnecting
@@ -713,11 +745,12 @@ fun HomeScreen(
                                     val kcpInt = if (batterySaverKcp) 50 else 20
                                     val dns = if (isCustomDns) customDnsServer else ""
                                     val port = sshPort.toIntOrNull() ?: 22
+                                    val vPort = v2rayPort.toIntOrNull() ?: 80
 
                                     onConnectToggle(
                                         selectedProtocol, useSlowDns, domain, pubKey, resolver, selectedRecordType,
                                         sshHost, port, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
-                                        v2rayRawLink, v2rayUuid, wakeLockEnabled, kcpInt, dns, selectedEngine
+                                        v2rayRawLink, v2rayUuid, v2rayHost, vPort, wakeLockEnabled, kcpInt, dns, selectedEngine
                                     )
                                 },
                                 modifier = Modifier

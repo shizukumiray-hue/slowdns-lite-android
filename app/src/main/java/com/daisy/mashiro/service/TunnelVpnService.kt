@@ -68,6 +68,8 @@ class TunnelVpnService : VpnService() {
                 val sshSni = intent.getStringExtra("EXTRA_SSH_SNI") ?: ""
                 val v2rayLink = intent.getStringExtra("EXTRA_V2RAY_LINK") ?: ""
                 val v2rayUuid = intent.getStringExtra("EXTRA_V2RAY_UUID") ?: ""
+                val v2rayHost = intent.getStringExtra("EXTRA_V2RAY_HOST") ?: "127.0.0.1"
+                val v2rayPort = intent.getIntExtra("EXTRA_V2RAY_PORT", 80)
                 val wakeLockEnabled = intent.getBooleanExtra("EXTRA_WAKELOCK", false)
                 val kcpInterval = intent.getIntExtra("EXTRA_KCP_INTERVAL", 50)
                 val customDns = intent.getStringExtra("EXTRA_CUSTOM_DNS") ?: ""
@@ -76,7 +78,7 @@ class TunnelVpnService : VpnService() {
                 startTunnel(
                     mode, useSlowDns, domain, pubkey, resolver, recordType,
                     sshHost, sshPort, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
-                    v2rayLink, v2rayUuid, wakeLockEnabled, kcpInterval, customDns, engine
+                    v2rayLink, v2rayUuid, v2rayHost, v2rayPort, wakeLockEnabled, kcpInterval, customDns, engine
                 )
             }
             ACTION_STOP -> stopTunnel()
@@ -102,13 +104,15 @@ class TunnelVpnService : VpnService() {
         sshSni: String,
         v2rayLink: String,
         v2rayUuid: String,
+        v2rayHost: String,
+        v2rayPort: Int,
         wakeLockEnabled: Boolean,
         kcpInterval: Int,
         customDns: String,
         engine: String
     ) {
         currentEngine = engine
-        val titleTarget = if (useSlowDns) domain else sshHost
+        val titleTarget = if (useSlowDns) domain else if (mode == "ssh") sshHost else v2rayHost
         startForeground(NOTIFICATION_ID, buildNotification("Menghubungkan ke $titleTarget..."))
         isServiceRunning = true
         _connectionState.value = ConnectionState.CONNECTING
@@ -139,24 +143,38 @@ class TunnelVpnService : VpnService() {
                 val fd = vpnInterface!!.fd
                 AppLogger.log("[VPN] TUN siap (fd: $fd)")
 
-                // Inisialisasi engine paket IP (HEV Socks5 C lwIP atau gVisor Go)
+                // Inisialisasi engine paket IP di worker daemon thread terpisah
                 if (currentEngine == "hev" && Socks5Tunnel.isAvailable()) {
-                    AppLogger.log("[Engine] Memulai HEV Socks5 Tunnel (C + lwIP, Ultra-hemat RAM)")
+                    AppLogger.log("[Engine] Menjalankan HEV Socks5 Tunnel daemon (C + lwIP)...")
                     val configYaml = Socks5Tunnel.generateConfig("127.0.0.1", 1080)
-                    Socks5Tunnel.tProxyStartService(configYaml, fd)
+                    Thread({
+                        try {
+                            Socks5Tunnel.tProxyStartService(configYaml, fd)
+                            AppLogger.log("[Engine] HEV Socks5 Tunnel worker berhenti")
+                        } catch (t: Throwable) {
+                            AppLogger.log("[Engine] HEV Tunnel exception: ${t.message}")
+                        }
+                    }, "hev-socks5-daemon").apply {
+                        isDaemon = true
+                        start()
+                    }
                 } else {
-                    AppLogger.log("[Engine] Memulai gVisor Netstack (Pure Go Userspace Stack)")
+                    AppLogger.log("[Engine] Menggunakan gVisor Netstack (Pure Go Userspace Stack)")
                 }
 
                 if (useSlowDns) {
                     AppLogger.log("[VPN] Target: SlowDNS :53 | Domain: $domain | Record: $recordType | Resolver: $resolver")
                     if (mode == "v2ray") {
-                        AppLogger.log("[VPN] V2Ray Mode: RAW TCP Stream (No TLS)")
+                        AppLogger.log("[VPN] V2Ray Mode: RAW TCP Stream ke $v2rayHost:$v2rayPort (No TLS)")
                     } else {
                         AppLogger.log("[VPN] SSH Mode: RAW TCP Stream ke $sshHost:$sshPort")
                     }
                 } else {
-                    AppLogger.log("[VPN] Target Direct: $sshHost:$sshPort | Enhanced: $sshEnhanced")
+                    if (mode == "ssh") {
+                        AppLogger.log("[VPN] Target Direct: $sshHost:$sshPort | Enhanced: $sshEnhanced")
+                    } else {
+                        AppLogger.log("[VPN] Target V2Ray: $v2rayLink")
+                    }
                 }
 
                 updateNotification("Terhubung: $titleTarget ($mode)")

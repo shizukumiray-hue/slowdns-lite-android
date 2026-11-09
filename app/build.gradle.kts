@@ -110,7 +110,12 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.1")
 
     // Go Native Core (AAR built by GoMobile)
-    compileOnly(files("libs/TunnelCore.aar"))
+    val coreAar = file("libs/TunnelCore.aar")
+    if (coreAar.exists()) {
+        implementation(files(coreAar))
+    } else {
+        compileOnly(files("libs/TunnelCore.aar"))
+    }
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")

@@ -60,12 +60,12 @@ class MainActivity : ComponentActivity() {
                         trafficSummary = trafficSummary,
                         onConnectToggle = { mode, useSlowDns, domain, pubkey, resolver, recordType,
                                             sshHost, sshPort, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
-                                            v2rayRawLink, v2rayUuid, wakeLock, kcpInterval, customDns, engine ->
+                                            v2rayRawLink, v2rayUuid, v2rayHost, v2rayPort, wakeLock, kcpInterval, customDns, engine ->
                             handleConnectToggle(
                                 connectionState,
                                 mode, useSlowDns, domain, pubkey, resolver, recordType,
                                 sshHost, sshPort, sshUser, sshPass, sshEnhanced, sshPayload, sshSni,
-                                v2rayRawLink, v2rayUuid, wakeLock, kcpInterval, customDns, engine
+                                v2rayRawLink, v2rayUuid, v2rayHost, v2rayPort, wakeLock, kcpInterval, customDns, engine
                             )
                         },
                         context = this
@@ -92,6 +92,8 @@ class MainActivity : ComponentActivity() {
         sshSni: String,
         v2rayRawLink: String,
         v2rayUuid: String,
+        v2rayHost: String,
+        v2rayPort: Int,
         wakeLock: Boolean,
         kcpInterval: Int,
         customDns: String,
@@ -136,6 +138,8 @@ class MainActivity : ComponentActivity() {
             putExtra("EXTRA_SSH_SNI", sshSni.trim())
             putExtra("EXTRA_V2RAY_LINK", v2rayRawLink.trim())
             putExtra("EXTRA_V2RAY_UUID", v2rayUuid.trim())
+            putExtra("EXTRA_V2RAY_HOST", v2rayHost.trim())
+            putExtra("EXTRA_V2RAY_PORT", v2rayPort)
             putExtra("EXTRA_WAKELOCK", wakeLock)
             putExtra("EXTRA_KCP_INTERVAL", kcpInterval)
             putExtra("EXTRA_CUSTOM_DNS", customDns.trim())
