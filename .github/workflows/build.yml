@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-go-core:
     name: Build Go Core AAR (ARMv7 + ARMv8)
@@ -36,7 +39,6 @@ jobs:
         run: |
           go mod tidy
           mkdir -p ../app/libs
-          # Target ARMv8 (arm64-v8a) & ARMv7 (armeabi-v7a)
           gomobile bind -v -target=android/arm64,android/arm -androidapi 21 -o ../app/libs/TunnelCore.aar .
 
       - name: Upload Core AAR
@@ -86,12 +88,36 @@ jobs:
           KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
           ALIAS_NAME: ${{ secrets.ALIAS_NAME }}
           ALIAS_PASS: ${{ secrets.ALIAS_PASS }}
-        run: gradle assembleRelease assembleDebug --stacktrace
+        run: gradle assembleRelease --stacktrace
 
-      - name: Upload APKs
+      - name: Organize APK Files
+        run: |
+          mkdir -p dist
+          find app/build/outputs/apk/release -name "*arm64-v8a*.apk" -exec cp {} dist/SlowDNS-Lite-arm64-v8a.apk \;
+          find app/build/outputs/apk/release -name "*armeabi-v7a*.apk" -exec cp {} dist/SlowDNS-Lite-armeabi-v7a.apk \;
+          find app/build/outputs/apk/release -name "*universal*.apk" -exec cp {} dist/SlowDNS-Lite-universal.apk \;
+          ls -la dist/
+
+      - name: Upload Artifacts (Individual Files)
         uses: actions/upload-artifact@v4
         with:
-          name: slowdns-lite-apks
-          path: |
-            app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/debug/*.apk
+          name: slowdns-lite-individual-apks
+          path: dist/*.apk
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: "v1.0.${{ github.run_number }}"
+          name: "SlowDNS Lite v1.0.${{ github.run_number }} (Signed)"
+          draft: false
+          prerelease: false
+          body: |
+            ### 🚀 Unduh APK SlowDNS Lite (Signed Resmi):
+            Pilih APK sesuai arsitektur HP kamu:
+            - **[SlowDNS-Lite-arm64-v8a.apk](https://github.com/${{ github.repository }}/releases/download/v1.0.${{ github.run_number }}/SlowDNS-Lite-arm64-v8a.apk)**: HP Android 64-bit modern (Rekomendasi).
+            - **[SlowDNS-Lite-armeabi-v7a.apk](https://github.com/${{ github.repository }}/releases/download/v1.0.${{ github.run_number }}/SlowDNS-Lite-armeabi-v7a.apk)**: HP Android 32-bit.
+            - **[SlowDNS-Lite-universal.apk](https://github.com/${{ github.repository }}/releases/download/v1.0.${{ github.run_number }}/SlowDNS-Lite-universal.apk)**: Semua perangkat Android.
+          files: dist/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
